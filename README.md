@@ -129,6 +129,7 @@ E2E tok/s:  agg=31.7
 - [Estonia Profile Details](#estonia-profile-details)
 - [Memory Usage (VRAM)](#memory-usage-vram)
 - [Known Issues and Fixes](#known-issues-and-fixes)
+- [Thermal Throttling & Auxiliary GPU Load](#6-thermal-throttling--auxiliary-gpu-load)
 
 ---
 
@@ -158,6 +159,7 @@ This study characterizes DeepSeek-V4-Flash inference on the **4× RTX PRO 6000 B
 - **MTP=2 acceptance rate**: ~56% mean across the matrix
 - **All 128K context cells succeed** — no OOM or timeout failures (unlike prior TP=2 runs which failed at 64K+)
 
+> **⚠️ Results are conservative.** GPU-0 and GPU-2 experienced thermal throttling during sustained high-concurrency cells, and the [Hindsight](https://github.com/jcartu/rasputin-memory) embedding service was running continuously on GPU-0 throughout the benchmark — consuming VRAM, compute cycles, and generating heat. A dedicated TP=4 setup with adequate cooling and no auxiliary GPU workloads would likely achieve materially higher throughput across all cells. See [Known Issues §6](#6-thermal-throttling--auxiliary-gpu-load).
 ---
 
 ## Hardware Requirements
@@ -181,12 +183,15 @@ GPU3    NODE    NODE    NODE     X
 
 All GPUs connected via PCIe through a single NUMA node (no NVLink). Verified at full **PCIe Gen5 (32 GT/s) x16** under active GPU compute pressure.
 
+> **⚠️ GPU-0 dual-use.** GPU-0 was simultaneously running the [Hindsight](https://github.com/jcartu/rasputin-memory) embedding service (MPS-backed sentence transformer) throughout the benchmark, consuming ~2–4 GiB VRAM and generating continuous heat. This inflates GPU-0 temperature relative to the other GPUs and contributes to the thermal throttling documented in [Known Issues §6](#6-thermal-throttling--auxiliary-gpu-load).
+
 ### Driver / CUDA Versions
 
 - NVIDIA Driver: **595.71.05**
 - CUDA Version: **13.2** (host); **13.2.1** (container)
 - VRAM per GPU: 97,887 MiB
 - Power limit: 600 W per card
+- GPU clocks: 2,752–2,812 MHz sustained under load (max: 3,090 MHz) — GPU-0 and GPU-2 were observed throttling below base clock during sustained high-concurrency cells due to thermal limits
 - GPU clocks: 2,752–2,812 MHz sustained under load (max: 3,090 MHz)
 - Host OS: Linux 7.0.10-arch1-1, 251 GB system RAM, Intel Xeon W (W790E-SAGE motherboard)
 
@@ -495,6 +500,32 @@ The model correctly identifies the company (Mirel Industrial) but confuses its c
 **Cause:** vLLM's custom all-reduce kernel requires NVLink peer mappings. On PCIe-only topology, it deadlocks.
 
 **Workaround:** Always include `--disable-custom-all-reduce` on Blackwell PCIe systems without NVLink.
+
+### 6. Thermal Throttling & Auxiliary GPU Load
+
+**Symptom:** GPU-0 and GPU-2 were observed running below their base clock during sustained high-concurrency decode cells (c ≥ 16), while GPU-1 and GPU-3 maintained normal boost clocks.
+
+**Cause:** Two contributing factors:
+
+1. **Thermal throttling.** The 4× RTX PRO 6000 Blackwell cards are mounted in a standard workstation chassis with limited airflow between adjacent cards. GPU-0 and GPU-2 are positioned at the edges of the PCIe slot cluster where airflow is poorest. Under sustained 600 W load per card, these GPUs hit the thermal ceiling and the driver downclocks them to stay within limits.
+2. **Auxiliary GPU load on GPU-0.** The [Hindsight](https://github.com/jcartu/rasputin-memory) embedding service (sentence-transformers, MPS backend) was running continuously on GPU-0 throughout the entire benchmark. This consumed ~2–4 GiB of VRAM, generated additional heat on the already-hottest GPU, and stole compute cycles that would otherwise be available for the vLLM inference worker.
+
+**Impact on results:** All throughput numbers in this study are **conservative**. A dedicated TP=4 system with:
+
+- Adequate cooling (e.g., water-cooled or open-air chassis with direct GPU fan airflow)
+- No auxiliary GPU workloads competing for VRAM or compute
+- All 4 GPUs running at full boost clock without thermal throttling
+
+would likely achieve materially higher throughput — particularly at high concurrency where thermal throttling bites hardest. The magnitude of the headroom is unknown but could be **10–25%+** at c ≥ 16 based on the observed clock frequency deltas.
+
+**Workaround for reproduction:** To match or exceed these numbers:
+
+1. Ensure all 4 GPUs are adequately cooled and not sharing a chassis with other high-TDP cards
+2. Reserve GPU-0 exclusively for vLLM (no Hindsight or other services)
+3. Monitor clock frequencies with `nvidia-smi dmon` during runs — if any GPU drops below base clock, improve cooling before trusting the numbers
+4. Consider `CUDA_VISIBLE_DEVICES=1,2,3` to exclude GPU-0 entirely if auxiliary loads cannot be moved
+
+**Errata note:** These conditions were not controlled for in this study. The numbers represent what a real-world all-in-one workstation running multiple AI services can achieve, not what a dedicated inference server would deliver. Readers should treat the results as a **lower bound** on expected TP=4 performance.
 
 ### 5. Cold boot is slow (~295 s)
 
